@@ -241,6 +241,17 @@ pub struct PartInfo {
     sector_count_lba: u32,
 }
 
+impl PartInfo {
+    pub fn is_zeroed(&self) -> bool {
+        !self.bootable
+            && self.first_sector_chs.raw == [0, 0, 0]
+            && self.part_type == PartType::Empty
+            && self.last_sector_chs.raw == [0, 0, 0]
+            && self.start_sector_lba == 0
+            && self.sector_count_lba == 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum PartInfoErr {
     UnclearBootable,
@@ -293,12 +304,17 @@ pub struct MbrPartTable {
 
 impl From<[u8; 64]> for MbrPartTable {
     fn from(buf: [u8; 64]) -> Self {
+        let from_slice = |buf| match PartInfo::try_from(<[u8; 16]>::try_from(buf).unwrap()).ok() {
+            // We'll convert empty partition types into Nones here
+            Some(p) if p.is_zeroed() => None,
+            x => x,
+        };
         MbrPartTable {
             entries: [
-                PartInfo::try_from(<[u8; 16]>::try_from(&buf[0..16]).unwrap()).ok(),
-                PartInfo::try_from(<[u8; 16]>::try_from(&buf[16..32]).unwrap()).ok(),
-                PartInfo::try_from(<[u8; 16]>::try_from(&buf[32..48]).unwrap()).ok(),
-                PartInfo::try_from(<[u8; 16]>::try_from(&buf[48..64]).unwrap()).ok(),
+                from_slice(&buf[0..16]),
+                from_slice(&buf[16..32]),
+                from_slice(&buf[32..48]),
+                from_slice(&buf[48..64]),
             ],
         }
     }
