@@ -33,6 +33,7 @@ pub enum PartType {
     DynamicDisk,
     Gpfs,
     LinuxSwap,
+    /// EXT3, EXT4, BTRFS etc.
     LinuxNative,
     IntelRapidStart,
     LinuxLvm,
@@ -206,13 +207,16 @@ pub struct ChsEntry {
     pub raw: [u8; 3],
 }
 
+/// masks off the lowest 6 bits
+const SECTOR_MASK: u8 = 0x3F;
+
 impl ChsEntry {
     /// Note that only the 6 bottom bits of sector and 10 bottom bits of cylinder will be used
-    pub fn new(head: u8, sector: u8, cylinder: u16) -> Self {
+    pub fn new(cylinder: u16, head: u8, sector: u8) -> Self {
         ChsEntry {
             raw: [
                 head,
-                sector & 0x1f | ((cylinder & 0x300) >> 2) as u8,
+                (sector & SECTOR_MASK) | (((cylinder & 0x300) >> 2) as u8),
                 (cylinder & 0xFF) as u8,
             ],
         }
@@ -223,11 +227,28 @@ impl ChsEntry {
     }
 
     pub fn sector(&self) -> u8 {
-        self.raw[1] & 0xF1
+        self.raw[1] & SECTOR_MASK
     }
 
     pub fn cylinder(&self) -> u16 {
-        self.raw[2] as u16 | (((self.raw[1] & 0xc0) as u16) << 2)
+        (((self.raw[1] & !SECTOR_MASK) as u16) << 2) | (self.raw[2] as u16)
+    }
+
+    pub fn chs(&self) -> (u16, u8, u8) {
+        (self.cylinder(), self.head(), self.sector())
+    }
+
+    pub fn from_lba(lba: u32) -> Self {
+        let heads_per_cylinder: u32 = 255;
+        let sectors_per_track: u32 = 63;
+        let cylinder = lba / (heads_per_cylinder * sectors_per_track);
+        let head = (lba / sectors_per_track) % heads_per_cylinder;
+        let sector = lba % sectors_per_track + 1;
+        ChsEntry::new(
+            u16::try_from(cylinder).unwrap(),
+            u8::try_from(head).unwrap(),
+            u8::try_from(sector).unwrap(),
+        )
     }
 }
 
@@ -242,6 +263,22 @@ pub struct PartInfo {
 }
 
 impl PartInfo {
+    pub fn from_lba(
+        bootable: bool,
+        start_sector_lba: u32,
+        sector_count_lba: u32,
+        part_type: PartType,
+    ) -> Self {
+        Self {
+            bootable,
+            first_sector_chs: ChsEntry::from_lba(start_sector_lba),
+            last_sector_chs: ChsEntry::from_lba(start_sector_lba + sector_count_lba),
+            start_sector_lba,
+            sector_count_lba,
+            part_type,
+        }
+    }
+
     pub fn is_zeroed(&self) -> bool {
         !self.bootable
             && self.first_sector_chs.raw == [0, 0, 0]
@@ -468,13 +505,152 @@ impl TryFrom<&Mbr> for [u8; 512] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
+    use std::{fs::File, io::Write};
 
     #[test]
     fn read_mbr() {
         let raspios_img = File::open("./raspios.img").unwrap();
         let mbr = Mbr::try_from_reader(raspios_img).unwrap();
         dbg!(mbr);
+        let partuuid = format!("{:x}", u32::from_le_bytes(mbr.drive_signature));
+        println!("PARTUUID: {}", partuuid);
+
+        let e1 = ChsEntry { raw: [0, 1, 64] };
+        let c: u32 = e1.cylinder() as u32;
+        let h: u32 = e1.head() as u32;
+        let s: u32 = e1.sector() as u32 - 1;
+        dbg!((c, h, s));
+        let lba = (c * 255 + h) * 63 + s - 1;
+        dbg!(lba);
+        // dbg!(ChsEntry::new(33, 4, 4));
+        // dbg!((e1.cylinder(), e1.head(), e1.sector()));
+
+        dbg!(PartInfo::from_lba(
+            false,
+            8192,
+            524288,
+            PartType::Fat32 {
+                visible: true,
+                scheme: AddrScheme::Lba,
+            }
+        ));
+        dbg!(PartInfo::from_lba(
+            false,
+            8192,
+            524288,
+            PartType::Fat32 {
+                visible: true,
+                scheme: AddrScheme::Lba,
+            }
+        )
+        .first_sector_chs
+        .chs());
+
+        let mut out_file = File::create("./out.img").unwrap();
+        let buf = <[u8; 512]>::try_from(&mbr).unwrap();
+        out_file.write_all(&buf).unwrap();
         panic!()
     }
+
+    #[test]
+    fn chs_entry_inv() {
+        let e1 = ChsEntry { raw: [6, 4, 33] };
+
+        let c = e1.cylinder();
+        let h = e1.head();
+        let s = e1.sector();
+
+        let e2 = ChsEntry::new(c, h, s);
+        assert_eq!(e1, e2);
+
+        let e1 = ChsEntry { raw: [127, 42, 33] };
+
+        let c = e1.cylinder();
+        let h = e1.head();
+        let s = e1.sector();
+
+        let e2 = ChsEntry::new(c, h, s);
+        assert_eq!(e1, e2);
+
+        let e1 = ChsEntry {
+            raw: [42, 137, 0b11001010],
+        };
+
+        let c = e1.cylinder();
+        let h = e1.head();
+        let s = e1.sector();
+
+        let e2 = ChsEntry::new(c, h, s);
+        assert_eq!(e1, e2);
+    }
+
+    #[test]
+    #[ignore]
+    fn chs_from_lba() {
+        assert_eq!(
+            PartInfo::from_lba(
+                false,
+                8192,
+                524288,
+                PartType::Fat32 {
+                    visible: true,
+                    scheme: AddrScheme::Lba,
+                }
+            ),
+            PartInfo {
+                bootable: false,
+                first_sector_chs: ChsEntry { raw: [0, 1, 64,] },
+                part_type: PartType::Fat32 {
+                    visible: true,
+                    scheme: AddrScheme::Lba,
+                },
+                last_sector_chs: ChsEntry {
+                    raw: [3, 224, 255,],
+                },
+                start_sector_lba: 8192,
+                sector_count_lba: 524288,
+            }
+        );
+    }
 }
+
+/*
+ mbr.partition_table = MbrPartTable {
+            entries: [
+                Some(PartInfo {
+                    bootable: true,
+                    first_sector_chs:
+                }),
+                None,
+                None,
+                None,
+            ]
+        };
+*/
+
+/*
+
+        PartInfo {
+            bootable: false,
+            first_sector_chs: ChsEntry {
+                raw: [
+                    0,
+                    1,
+                    64,
+                ],
+            },
+            part_type: Fat32 {
+                visible: true,
+                scheme: Lba,
+            },
+            last_sector_chs: ChsEntry {
+                raw: [
+                    3,
+                    224,
+                    255,
+                ],
+            },
+            start_sector_lba: 8192,
+            sector_count_lba: 524288,
+        },
+*/
