@@ -1,103 +1,6 @@
 use std::io::Read;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub struct RawMbr {
-    buf: [u8; 512],
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub enum MbrProblem {
-    NullSectorIsNotNull,
-    BootloaderSignatureNotSet,
-}
-
-impl RawMbr {
-    pub fn bootloader_mut(&mut self) -> &mut [u8; 440] {
-        (&mut self.buf[0..440]).try_into().unwrap()
-    }
-
-    pub fn drive_signature_mut(&mut self) -> &mut [u8; 4] {
-        (&mut self.buf[440..444]).try_into().unwrap()
-    }
-
-    pub fn null_sector_mut(&mut self) -> &mut [u8; 2] {
-        (&mut self.buf[444..446]).try_into().unwrap()
-    }
-
-    pub fn partition_table_mut(&mut self) -> &mut [u8; 64] {
-        (&mut self.buf[446..510]).try_into().unwrap()
-    }
-
-    pub fn bootsector_signature_mut(&mut self) -> &mut [u8; 2] {
-        (&mut self.buf[510..511]).try_into().unwrap()
-    }
-
-    pub fn bootloader(&self) -> &[u8; 440] {
-        self.buf[0..440].try_into().unwrap()
-    }
-
-    pub fn drive_signature(&self) -> &[u8; 4] {
-        self.buf[440..444].try_into().unwrap()
-    }
-
-    pub fn null_sector(&self) -> &[u8; 2] {
-        self.buf[444..446].try_into().unwrap()
-    }
-
-    pub fn partition_table(&self) -> MbrPartTable {
-        MbrPartTable {
-            buf: self.buf[446..510].try_into().unwrap(),
-        }
-    }
-
-    pub fn bootsector_signature(&self) -> &[u8; 2] {
-        self.buf[510..512].try_into().unwrap()
-    }
-
-    pub fn try_from_reader<B>(mut reader: B) -> Result<Self, std::io::Error>
-    where
-        B: Read,
-    {
-        use std::io::{Error, ErrorKind};
-        let mut buf = [0; 512];
-        match reader.read(&mut buf) {
-            Ok(512) => Ok(Self { buf }),
-            Ok(n_bytes_read) => Err(Error::new(
-                ErrorKind::UnexpectedEof,
-                format!("Reader could not supply the requires 512 bytes for an MBR. Could only read {} bytes.", n_bytes_read),
-            )),
-            Err(e) => Err(e),
-        }
-    }
-
-    pub fn validate(&self) -> Option<MbrProblem> {
-        if self.null_sector() != &[0, 0] {
-            Some(MbrProblem::NullSectorIsNotNull)
-        } else if self.bootsector_signature() != &[0x55, 0xAA] {
-            Some(MbrProblem::BootloaderSignatureNotSet)
-        } else {
-            None
-        }
-    }
-
-    pub fn set_bootsector_sig(&mut self) {
-        *self.bootsector_signature_mut() = [0x55, 0xAA];
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub struct MbrPartTable<'a> {
-    buf: &'a [u8; 64],
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub struct PartInfo<'a> {
-    // all entries are stored in little endian format
-    // unused entries should be zeroed
-    buf: &'a [u8; 16],
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum AddrScheme {
     Chs,
     Lba,
@@ -221,56 +124,319 @@ impl TryFrom<u8> for PartType {
     }
 }
 
-impl<'a> PartInfo<'a> {
-    pub fn bootable(&self) -> Result<bool, u8> {
-        match self.buf[0] {
-            0x80 => Ok(true),
-            0x00 => Ok(false),
-            n => Err(n),
+impl TryFrom<PartType> for u8 {
+    type Error = ();
+    fn try_from(part_type: PartType) -> Result<Self, Self::Error> {
+        use AddrScheme::*;
+        use PartType::*;
+
+        match part_type {
+            Empty => Ok(0x00),
+            Fat12 { visible: true } => Ok(0x01),
+            Fat12 { visible: false } => Ok(0x02),
+            Oem => Ok(0x12),
+            Fat16 {
+                visible: true,
+                leq32mib: true,
+                scheme: Chs,
+            } => Ok(0x04),
+            Fat16 {
+                visible: false,
+                leq32mib: true,
+                scheme: Chs,
+            } => Ok(0x14),
+            Extended { scheme: Chs } => Ok(0x05),
+            Fat16 {
+                visible: true,
+                leq32mib: false,
+                scheme: Chs,
+            } => Ok(0x06),
+            ExFAT { visible: true } => Ok(0x07),
+            ExFAT { visible: false } => Ok(0x17),
+            Fat32 {
+                visible: true,
+                scheme: Chs,
+            } => Ok(0x0B),
+            Fat32 {
+                visible: false,
+                scheme: Chs,
+            } => Ok(0x1B),
+            Fat32 {
+                visible: true,
+                scheme: Lba,
+            } => Ok(0x0C),
+            Fat32 {
+                visible: false,
+                scheme: Lba,
+            } => Ok(0x1C),
+            Fat16 {
+                visible: true,
+                leq32mib: false,
+                scheme: Lba,
+            } => Ok(0x0E),
+            Fat16 {
+                visible: false,
+                leq32mib: false,
+                scheme: Lba,
+            } => Ok(0x1E),
+            Extended { scheme: Lba } => Ok(0x0F),
+            WindowsRe => Ok(0x27),
+            DynamicDisk => Ok(0x42),
+            Gpfs => Ok(0x75),
+            LinuxSwap => Ok(0x82),
+            LinuxNative => Ok(0x83),
+            IntelRapidStart => Ok(0x84),
+            LinuxLvm => Ok(0x8E),
+            FreeBsd => Ok(0xA5),
+            OpenBsd => Ok(0xA6),
+            NetBsd => Ok(0xA9),
+            MacOs => Ok(0xAF),
+            Solaris => Ok(0xBF),
+            BeOs => Ok(0xEB),
+            ProtectiveMbr => Ok(0xEE),
+            Efi => Ok(0xEF),
+            LinuxRaid => Ok(0xFD),
+            _ => Err(()),
         }
-    }
-
-    /// CHS entry of first sector
-    pub fn first_sector_chs(&self) -> &[u8; 3] {
-        self.buf[1..4].try_into().unwrap()
-    }
-
-    pub fn part_typ(&self) -> Result<PartType, ()> {
-        PartType::try_from(self.buf[4])
-    }
-
-    /// CHS entry of last sector
-    pub fn last_sector_chs(&self) -> &[u8; 3] {
-        self.buf[5..8].try_into().unwrap()
-    }
-
-    pub fn start_sector_lba(&self) -> &[u8; 4] {
-        self.buf[8..12].try_into().unwrap()
-    }
-
-    pub fn sector_count_lba(&self) -> &[u8; 4] {
-        self.buf[12..16].try_into().unwrap()
     }
 }
 
-impl<'a> MbrPartTable<'a> {
-    /// Not all entries might be valid
-    /// TODO: parse entries directly and return options
-    pub fn entries(&self) -> [PartInfo; 4] {
-        [
-            PartInfo {
-                buf: self.buf[0..16].try_into().unwrap(),
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct ChsEntry {
+    pub raw: [u8; 3],
+}
+
+impl ChsEntry {
+    /// Note that only the 6 bottom bits of sector and 10 bottom bits of cylinder will be used
+    pub fn new(head: u8, sector: u8, cylinder: u16) -> Self {
+        ChsEntry {
+            raw: [
+                head,
+                sector & 0x1f | ((cylinder & 0x300) >> 2) as u8,
+                (cylinder & 0xFF) as u8,
+            ],
+        }
+    }
+
+    pub fn head(&self) -> u8 {
+        self.raw[0]
+    }
+
+    pub fn sector(&self) -> u8 {
+        self.raw[1] & 0xF1
+    }
+
+    pub fn cylinder(&self) -> u16 {
+        self.raw[2] as u16 | (((self.raw[1] & 0xc0) as u16) << 2)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct PartInfo {
+    bootable: bool,
+    first_sector_chs: ChsEntry,
+    part_type: PartType,
+    last_sector_chs: ChsEntry,
+    start_sector_lba: u32,
+    sector_count_lba: u32,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum PartInfoErr {
+    UnclearBootable,
+    UnknownPartType,
+}
+
+impl TryFrom<[u8; 16]> for PartInfo {
+    type Error = PartInfoErr;
+    fn try_from(buf: [u8; 16]) -> Result<Self, Self::Error> {
+        let bootable = match buf[0] {
+            0x80 => Ok(true),
+            0x00 => Ok(false),
+            _ => Err(PartInfoErr::UnclearBootable),
+        }?;
+        let part_type = PartType::try_from(buf[4]).map_err(|_| PartInfoErr::UnknownPartType)?;
+
+        Ok(PartInfo {
+            bootable,
+            part_type,
+            first_sector_chs: ChsEntry {
+                raw: buf[1..4].try_into().unwrap(),
             },
-            PartInfo {
-                buf: self.buf[16..2 * 16].try_into().unwrap(),
+            last_sector_chs: ChsEntry {
+                raw: buf[5..8].try_into().unwrap(),
             },
-            PartInfo {
-                buf: self.buf[2 * 16..3 * 16].try_into().unwrap(),
-            },
-            PartInfo {
-                buf: self.buf[3 * 16..64].try_into().unwrap(),
-            },
-        ]
+            start_sector_lba: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            sector_count_lba: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+        })
+    }
+}
+
+impl TryFrom<PartInfo> for [u8; 16] {
+    type Error = PartInfoErr;
+    fn try_from(part: PartInfo) -> Result<Self, Self::Error> {
+        let mut buf = [0; 16];
+        buf[0] = if part.bootable { 0x80 } else { 0x00 };
+        buf[4] = u8::try_from(part.part_type).map_err(|_| PartInfoErr::UnknownPartType)?;
+        buf[1..4].copy_from_slice(&part.first_sector_chs.raw);
+        buf[5..8].copy_from_slice(&part.last_sector_chs.raw);
+        buf[8..12].copy_from_slice(&part.start_sector_lba.to_le_bytes());
+        buf[12..16].copy_from_slice(&part.sector_count_lba.to_le_bytes());
+        Ok(buf)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct MbrPartTable {
+    pub entries: [Option<PartInfo>; 4],
+}
+
+impl From<[u8; 64]> for MbrPartTable {
+    fn from(buf: [u8; 64]) -> Self {
+        MbrPartTable {
+            entries: [
+                PartInfo::try_from(<[u8; 16]>::try_from(&buf[0..16]).unwrap()).ok(),
+                PartInfo::try_from(<[u8; 16]>::try_from(&buf[16..32]).unwrap()).ok(),
+                PartInfo::try_from(<[u8; 16]>::try_from(&buf[32..48]).unwrap()).ok(),
+                PartInfo::try_from(<[u8; 16]>::try_from(&buf[48..64]).unwrap()).ok(),
+            ],
+        }
+    }
+}
+
+impl TryFrom<MbrPartTable> for [u8; 64] {
+    type Error = PartInfoErr;
+    fn try_from(tbl: MbrPartTable) -> Result<Self, Self::Error> {
+        let mut buf = [0; 64];
+        buf[0..16].copy_from_slice(&match tbl.entries[0] {
+            Some(e) => <[u8; 16]>::try_from(e)?,
+            _ => Default::default(),
+        });
+        buf[16..32].copy_from_slice(&match tbl.entries[1] {
+            Some(e) => <[u8; 16]>::try_from(e)?,
+            _ => Default::default(),
+        });
+        buf[32..48].copy_from_slice(&match tbl.entries[2] {
+            Some(e) => <[u8; 16]>::try_from(e)?,
+            _ => Default::default(),
+        });
+        buf[48..64].copy_from_slice(&match tbl.entries[3] {
+            Some(e) => <[u8; 16]>::try_from(e)?,
+            _ => Default::default(),
+        });
+        Ok(buf)
+    }
+}
+
+impl MbrPartTable {
+    pub fn try_from_reader<B>(mut reader: B) -> Result<Self, std::io::Error>
+    where
+        B: Read,
+    {
+        use std::io::{Error, ErrorKind};
+
+        let mut buf = [0; 64];
+        match reader.read(&mut buf) {
+            Ok(64) => Ok(Self::from(buf)),
+            Ok(n_bytes_read) => Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                format!("Reader could not read 64 bytes for MBR partition table. Could only read {} bytes.", n_bytes_read),
+            )),
+            Err(e) => Err(e)
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct Mbr {
+    pub bootloader: [u8; 440],
+    pub drive_signature: [u8; 4],
+    pub partition_table: MbrPartTable,
+    pub bootsector_signature: [u8; 2],
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct RawMbr {
+    buf: [u8; 512],
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum MbrProblem {
+    NullSectorIsNotNull,
+    BootloaderSignatureNotSet,
+}
+
+impl Mbr {
+    pub fn try_from_reader<B>(mut reader: B) -> Result<Self, std::io::Error>
+    where
+        B: Read,
+    {
+        use std::io::{Error, ErrorKind};
+
+        let mut bootloader = [0; 440];
+        match reader.read(&mut bootloader) {
+            Ok(440) => Ok(()),
+            Ok(n_bytes_read) => Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                format!(
+                    "Could not read 440 bytes for MBR bootloader. Could only read {} bytes.",
+                    n_bytes_read
+                ),
+            )),
+            Err(e) => Err(e),
+        }?;
+
+        let mut drive_signature = [0; 4];
+        match reader.read(&mut drive_signature) {
+            Ok(4) => Ok(()),
+            Ok(n_bytes_read) => Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                format!(
+                    "Could not read 4 bytes for MBR drive signature. Could only read {} bytes.",
+                    n_bytes_read
+                ),
+            )),
+            Err(e) => Err(e),
+        }?;
+
+        let mut zero_buf = [0; 2];
+        match reader.read(&mut zero_buf) {
+            Ok(2) if zero_buf == [0, 0] => Ok(()),
+            // Copy protected according to spec on wikipedia - we'll just ignore it
+            Ok(2) if zero_buf == [0x5A, 0x5A] => Ok(()),
+            Ok(2) => Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "MBR null sector is not null but rather {:02x} {:02x}",
+                    zero_buf[0], zero_buf[1]
+                ),
+            )),
+            Ok(n_bytes_read) => Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                format!(
+                    "Could not read 2 bytes for MBR null sector. Could only read {} bytes.",
+                    n_bytes_read
+                ),
+            )),
+            Err(e) => Err(e),
+        }?;
+
+        let partition_table = MbrPartTable::try_from_reader(&mut reader)?;
+        let mut bootsector_signature = [0; 2];
+
+        match reader.read(&mut bootsector_signature) {
+            Ok(2) => Ok(()),
+            Ok(n_bytes_read) => Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                format!("Could not read the required 2 bytes for MBR bootsector signature. Could only read {} bytes.", n_bytes_read),
+            )),
+            Err(e) => Err(e),
+        }?;
+        Ok(Self {
+            bootloader,
+            drive_signature,
+            partition_table,
+            bootsector_signature,
+        })
     }
 }
 
@@ -282,11 +448,8 @@ mod tests {
     #[test]
     fn read_mbr() {
         let raspios_img = File::open("./raspios.img").unwrap();
-        let mbr = RawMbr::try_from_reader(raspios_img).unwrap();
-        dbg!(mbr.bootloader());
-        dbg!(mbr.validate());
-        dbg!(mbr.partition_table().entries()[0].part_typ());
-        dbg!(mbr.partition_table().entries()[1].part_typ());
+        let mbr = Mbr::try_from_reader(raspios_img).unwrap();
+        dbg!(mbr);
         panic!()
     }
 }
