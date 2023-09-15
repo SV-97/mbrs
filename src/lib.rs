@@ -355,11 +355,6 @@ pub struct Mbr {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub struct RawMbr {
-    buf: [u8; 512],
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum MbrProblem {
     NullSectorIsNotNull,
     BootloaderSignatureNotSet,
@@ -437,6 +432,20 @@ impl Mbr {
             partition_table,
             bootsector_signature,
         })
+    }
+}
+
+impl TryFrom<&Mbr> for [u8; 512] {
+    type Error = PartInfoErr;
+    fn try_from(mbr: &Mbr) -> Result<Self, Self::Error> {
+        let mut buf = [0; 512];
+        buf[0..440].copy_from_slice(&mbr.bootloader);
+        buf[440..444].copy_from_slice(&mbr.drive_signature);
+        // if we ever care about the copy protection it should go here
+        // buf[444..446].copy_from_slice(&mbr.drive_signature);
+        buf[446..510].copy_from_slice(&<[u8; 64]>::try_from(mbr.partition_table)?);
+        buf[510..512].copy_from_slice(&mbr.bootsector_signature);
+        Ok(buf)
     }
 }
 
