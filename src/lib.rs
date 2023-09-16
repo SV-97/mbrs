@@ -48,6 +48,27 @@ pub enum PartType {
     LinuxRaid,
 }
 
+impl PartType {
+    /// returns the addressing scheme (CHS or LBA) used by partitions of the given type
+    pub fn addr_scheme(&self) -> AddrScheme {
+        match self {
+            PartType::Fat32 { scheme, .. }
+            | PartType::Fat16 { scheme, .. }
+            | PartType::Extended { scheme, .. } => *scheme,
+            PartType::LinuxNative => AddrScheme::Lba,
+            _ => unimplemented!(),
+        }
+    }
+
+    pub fn btrfs() -> Self {
+        PartType::LinuxNative
+    }
+
+    pub fn ext4() -> Self {
+        PartType::LinuxNative
+    }
+}
+
 impl TryFrom<u8> for PartType {
     type Error = ();
     fn try_from(value: u8) -> Result<Self, Self::Error> {
@@ -211,14 +232,20 @@ pub struct ChsEntry {
 const SECTOR_MASK: u8 = 0x3F;
 
 impl ChsEntry {
-    /// Note that only the 6 bottom bits of sector and 10 bottom bits of cylinder will be used
-    pub fn new(cylinder: u16, head: u8, sector: u8) -> Self {
-        ChsEntry {
-            raw: [
-                head,
-                (sector & SECTOR_MASK) | (((cylinder & 0x300) >> 2) as u8),
-                (cylinder & 0xFF) as u8,
-            ],
+    /// Note that only the 6 bottom bits of sector and 10 bottom bits of cylinder can be used for CHS.
+    /// If a value leaves this range this method returns None
+    // TODO: use https://crates.io/crates/arbitrary-int to fix the input types
+    pub fn try_from_chs(cylinder: u16, head: u8, sector: u8) -> Option<Self> {
+        if cylinder > 0x3FF || sector > 0x3F {
+            None
+        } else {
+            Some(ChsEntry {
+                raw: [
+                    head,
+                    (sector & SECTOR_MASK) | (((cylinder & 0x300) >> 2) as u8),
+                    (cylinder & 0xFF) as u8,
+                ],
+            })
         }
     }
 
@@ -238,17 +265,29 @@ impl ChsEntry {
         (self.cylinder(), self.head(), self.sector())
     }
 
-    pub fn from_lba(lba: u32) -> Self {
-        let heads_per_cylinder: u32 = 255;
-        let sectors_per_track: u32 = 63;
+    pub fn try_from_lba(lba: u32) -> Result<Self, (u32, u32, u32)> {
+        // let heads_per_cylinder: u32 = 255;
+        // let sectors_per_track: u32 = 63;
+        let heads_per_cylinder: u32 = 4;
+        let sectors_per_track: u32 = 32;
+
         let cylinder = lba / (heads_per_cylinder * sectors_per_track);
         let head = (lba / sectors_per_track) % heads_per_cylinder;
         let sector = lba % sectors_per_track + 1;
-        ChsEntry::new(
+        ChsEntry::try_from_chs(
             u16::try_from(cylinder).unwrap(),
             u8::try_from(head).unwrap(),
             u8::try_from(sector).unwrap(),
         )
+        .ok_or((cylinder, head, sector))
+    }
+
+    pub fn from_lba_truncating(lba: u32) -> Self {
+        ChsEntry::try_from_lba(lba).unwrap_or_else(|(c, h, s)| {
+            // If we're using LBA we don't really care about the CHS entries being correct. We simply
+            // truncate the "correct" values that CHS can't represent and use those instead.
+            ChsEntry::try_from_chs(c as u16 & 0x3FF, h as u8, s as u8 & SECTOR_MASK).unwrap()
+        })
     }
 }
 
@@ -263,19 +302,34 @@ pub struct PartInfo {
 }
 
 impl PartInfo {
-    pub fn from_lba(
+    pub fn try_from_lba(
         bootable: bool,
         start_sector_lba: u32,
         sector_count_lba: u32,
         part_type: PartType,
-    ) -> Self {
-        Self {
-            bootable,
-            first_sector_chs: ChsEntry::from_lba(start_sector_lba),
-            last_sector_chs: ChsEntry::from_lba(start_sector_lba + sector_count_lba),
-            start_sector_lba,
-            sector_count_lba,
-            part_type,
+    ) -> Result<Self, ()> {
+        let end_sector_lba = start_sector_lba + sector_count_lba - 1;
+        match part_type.addr_scheme() {
+            AddrScheme::Lba => Ok(Self {
+                bootable,
+                first_sector_chs: ChsEntry::from_lba_truncating(start_sector_lba),
+                last_sector_chs: ChsEntry::from_lba_truncating(end_sector_lba),
+                start_sector_lba,
+                sector_count_lba,
+                part_type,
+            }),
+            AddrScheme::Chs => {
+                let first_sector_chs = ChsEntry::try_from_lba(start_sector_lba).map_err(|_| ())?;
+                let last_sector_chs = ChsEntry::try_from_lba(end_sector_lba).map_err(|_| ())?;
+                Ok(Self {
+                    bootable,
+                    first_sector_chs,
+                    last_sector_chs,
+                    start_sector_lba,
+                    sector_count_lba,
+                    part_type,
+                })
+            }
         }
     }
 
@@ -286,6 +340,10 @@ impl PartInfo {
             && self.last_sector_chs.raw == [0, 0, 0]
             && self.start_sector_lba == 0
             && self.sector_count_lba == 0
+    }
+
+    pub fn end_sector_lba(&self) -> u32 {
+        self.start_sector_lba + self.sector_count_lba - 1
     }
 }
 
@@ -514,81 +572,62 @@ mod tests {
         dbg!(mbr);
         let partuuid = format!("{:x}", u32::from_le_bytes(mbr.drive_signature));
         println!("PARTUUID: {}", partuuid);
+    }
 
-        let e1 = ChsEntry { raw: [0, 1, 64] };
-        let c: u32 = e1.cylinder() as u32;
-        let h: u32 = e1.head() as u32;
-        let s: u32 = e1.sector() as u32 - 1;
-        dbg!((c, h, s));
-        let lba = (c * 255 + h) * 63 + s - 1;
-        dbg!(lba);
-        // dbg!(ChsEntry::new(33, 4, 4));
-        // dbg!((e1.cylinder(), e1.head(), e1.sector()));
-
-        dbg!(PartInfo::from_lba(
-            false,
-            8192,
-            524288,
-            PartType::Fat32 {
-                visible: true,
-                scheme: AddrScheme::Lba,
-            }
-        ));
-        dbg!(PartInfo::from_lba(
-            false,
-            8192,
-            524288,
-            PartType::Fat32 {
-                visible: true,
-                scheme: AddrScheme::Lba,
-            }
-        )
-        .first_sector_chs
-        .chs());
-
+    #[test]
+    fn read_and_write() {
+        let raspios_img = File::open("./raspios.img").unwrap();
+        let mut mbr = Mbr::try_from_reader(raspios_img).unwrap();
+        mbr.drive_signature = 0x090b3d33_u32.to_le_bytes();
+        mbr.partition_table.entries[2] = Some(
+            PartInfo::try_from_lba(
+                true,
+                mbr.partition_table.entries[1].unwrap().end_sector_lba(),
+                1024,
+                PartType::btrfs(),
+            )
+            .unwrap(),
+        );
         let mut out_file = File::create("./out.img").unwrap();
         let buf = <[u8; 512]>::try_from(&mbr).unwrap();
         out_file.write_all(&buf).unwrap();
-        panic!()
     }
 
     #[test]
     fn chs_entry_inv() {
         let e1 = ChsEntry { raw: [6, 4, 33] };
-
-        let c = e1.cylinder();
-        let h = e1.head();
-        let s = e1.sector();
-
-        let e2 = ChsEntry::new(c, h, s);
-        assert_eq!(e1, e2);
+        let (c, h, s) = e1.chs();
+        let e2 = ChsEntry::try_from_chs(c, h, s);
+        assert_eq!(Some(e1), e2);
 
         let e1 = ChsEntry { raw: [127, 42, 33] };
-
-        let c = e1.cylinder();
-        let h = e1.head();
-        let s = e1.sector();
-
-        let e2 = ChsEntry::new(c, h, s);
-        assert_eq!(e1, e2);
+        let (c, h, s) = e1.chs();
+        let e2 = ChsEntry::try_from_chs(c, h, s);
+        assert_eq!(Some(e1), e2);
 
         let e1 = ChsEntry {
             raw: [42, 137, 0b11001010],
         };
-
-        let c = e1.cylinder();
-        let h = e1.head();
-        let s = e1.sector();
-
-        let e2 = ChsEntry::new(c, h, s);
-        assert_eq!(e1, e2);
+        let (c, h, s) = e1.chs();
+        let e2 = ChsEntry::try_from_chs(c, h, s);
+        assert_eq!(Some(e1), e2);
     }
 
     #[test]
-    #[ignore]
+    fn lba_to_chs() {
+        assert_eq!(
+            ChsEntry::try_from_lba(8192),
+            Ok(ChsEntry::try_from_chs(64, 0, 1).unwrap())
+        );
+        assert_eq!(ChsEntry::try_from_lba(532479), Err((4159, 3, 32)));
+        assert_eq!(ChsEntry::try_from_lba(532480), Err((4160, 0, 1)));
+        assert_eq!(ChsEntry::try_from_lba(3842047), Err((30015, 3, 32)));
+    }
+
+    #[test]
     fn chs_from_lba() {
         assert_eq!(
-            PartInfo::from_lba(
+            PartInfo::try_from_lba(
                 false,
                 8192,
                 524288,
@@ -596,7 +635,8 @@ mod tests {
                     visible: true,
                     scheme: AddrScheme::Lba,
                 }
-            ),
+            )
+            .unwrap(),
             PartInfo {
                 bootable: false,
                 first_sector_chs: ChsEntry { raw: [0, 1, 64,] },
@@ -604,9 +644,7 @@ mod tests {
                     visible: true,
                     scheme: AddrScheme::Lba,
                 },
-                last_sector_chs: ChsEntry {
-                    raw: [3, 224, 255,],
-                },
+                last_sector_chs: ChsEntry { raw: [3, 32, 63,] },
                 start_sector_lba: 8192,
                 sector_count_lba: 524288,
             }
