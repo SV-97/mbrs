@@ -1,4 +1,5 @@
 use std::io::Read;
+use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum AddrScheme {
@@ -249,6 +250,10 @@ impl ChsEntry {
         }
     }
 
+    pub fn cylinder(&self) -> u16 {
+        (((self.raw[1] & !SECTOR_MASK) as u16) << 2) | (self.raw[2] as u16)
+    }
+
     pub fn head(&self) -> u8 {
         self.raw[0]
     }
@@ -257,15 +262,11 @@ impl ChsEntry {
         self.raw[1] & SECTOR_MASK
     }
 
-    pub fn cylinder(&self) -> u16 {
-        (((self.raw[1] & !SECTOR_MASK) as u16) << 2) | (self.raw[2] as u16)
-    }
-
     pub fn chs(&self) -> (u16, u8, u8) {
         (self.cylinder(), self.head(), self.sector())
     }
 
-    pub fn try_from_lba(lba: u32) -> Result<Self, (u32, u32, u32)> {
+    pub fn try_from_lba(lba: u32) -> Result<Self, MbrError> {
         // let heads_per_cylinder: u32 = 255;
         // let sectors_per_track: u32 = 63;
         let heads_per_cylinder: u32 = 4;
@@ -279,14 +280,33 @@ impl ChsEntry {
             u8::try_from(head).unwrap(),
             u8::try_from(sector).unwrap(),
         )
-        .ok_or((cylinder, head, sector))
+        .ok_or(MbrError::InvalidAddressChs {
+            cylinder,
+            head,
+            sector,
+        })
     }
 
+    /// Like `try_from_lba` but silently truncates the input
     pub fn from_lba_truncating(lba: u32) -> Self {
-        ChsEntry::try_from_lba(lba).unwrap_or_else(|(c, h, s)| {
-            // If we're using LBA we don't really care about the CHS entries being correct. We simply
-            // truncate the "correct" values that CHS can't represent and use those instead.
-            ChsEntry::try_from_chs(c as u16 & 0x3FF, h as u8, s as u8 & SECTOR_MASK).unwrap()
+        ChsEntry::try_from_lba(lba).unwrap_or_else(|e| {
+            if let MbrError::InvalidAddressChs {
+                cylinder,
+                head,
+                sector,
+            } = e
+            {
+                // If we're using LBA we don't really care about the CHS entries being correct. We simply
+                // truncate the "correct" values that CHS can't represent and use those instead.
+                ChsEntry::try_from_chs(
+                    cylinder as u16 & 0x3FF,
+                    head as u8,
+                    sector as u8 & SECTOR_MASK,
+                )
+                .unwrap()
+            } else {
+                panic!("Unexpected error: {}", e)
+            }
         })
     }
 }
@@ -301,13 +321,39 @@ pub struct PartInfo {
     sector_count_lba: u32,
 }
 
+// partition!(10 B, *, 100 MiB, true, Linux { lba: true })
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct IncompletePartInfo {
+    pub start_lba: Option<u32>,
+    pub end_lba: Option<u32>,
+    pub size_lba: Option<u32>,
+    pub bootable: bool,
+    pub part_type: PartType,
+}
+
+impl TryFrom<IncompletePartInfo> for PartInfo {
+    type Error = MbrError;
+    fn try_from(value: IncompletePartInfo) -> Result<Self, Self::Error> {
+        // Use 0 = start + size - end - 1 in different forms to calculate missing fields
+        let (start, size) = match (value.start_lba, value.end_lba, value.size_lba) {
+            (Some(start), Some(_end), Some(size)) => Ok((start, size)),
+            (Some(start), Some(end), None) => Ok((start, 1 + end - start)),
+            (Some(start), None, Some(size)) => Ok((start, size)),
+            (None, Some(end), Some(size)) => Ok((1 + end - size, end)),
+            _ => Err(MbrError::IncompleteInput),
+        }?;
+        PartInfo::try_from_lba(value.bootable, start, size, value.part_type)
+    }
+}
+
 impl PartInfo {
     pub fn try_from_lba(
         bootable: bool,
         start_sector_lba: u32,
         sector_count_lba: u32,
         part_type: PartType,
-    ) -> Result<Self, ()> {
+    ) -> Result<Self, MbrError> {
         let end_sector_lba = start_sector_lba + sector_count_lba - 1;
         match part_type.addr_scheme() {
             AddrScheme::Lba => Ok(Self {
@@ -319,8 +365,39 @@ impl PartInfo {
                 part_type,
             }),
             AddrScheme::Chs => {
-                let first_sector_chs = ChsEntry::try_from_lba(start_sector_lba).map_err(|_| ())?;
-                let last_sector_chs = ChsEntry::try_from_lba(end_sector_lba).map_err(|_| ())?;
+                let first_sector_chs = ChsEntry::try_from_lba(start_sector_lba)?;
+                let last_sector_chs = ChsEntry::try_from_lba(end_sector_lba)?;
+                Ok(Self {
+                    bootable,
+                    first_sector_chs,
+                    last_sector_chs,
+                    start_sector_lba,
+                    sector_count_lba,
+                    part_type,
+                })
+            }
+        }
+    }
+
+    pub fn try_from_lba_bounds(
+        bootable: bool,
+        start_sector_lba: u32,
+        end_sector_lba: u32,
+        part_type: PartType,
+    ) -> Result<Self, MbrError> {
+        let sector_count_lba = 1 + end_sector_lba - start_sector_lba;
+        match part_type.addr_scheme() {
+            AddrScheme::Lba => Ok(Self {
+                bootable,
+                first_sector_chs: ChsEntry::from_lba_truncating(start_sector_lba),
+                last_sector_chs: ChsEntry::from_lba_truncating(end_sector_lba),
+                start_sector_lba,
+                sector_count_lba,
+                part_type,
+            }),
+            AddrScheme::Chs => {
+                let first_sector_chs = ChsEntry::try_from_lba(start_sector_lba)?;
+                let last_sector_chs = ChsEntry::try_from_lba(end_sector_lba)?;
                 Ok(Self {
                     bootable,
                     first_sector_chs,
@@ -440,20 +517,18 @@ impl TryFrom<MbrPartTable> for [u8; 64] {
 }
 
 impl MbrPartTable {
-    pub fn try_from_reader<B>(mut reader: B) -> Result<Self, std::io::Error>
+    pub fn try_from_reader<B>(mut reader: B) -> Result<Self, MbrError>
     where
         B: Read,
     {
-        use std::io::{Error, ErrorKind};
-
         let mut buf = [0; 64];
         match reader.read(&mut buf) {
             Ok(64) => Ok(Self::from(buf)),
-            Ok(n_bytes_read) => Err(Error::new(
-                ErrorKind::UnexpectedEof,
-                format!("Reader could not read 64 bytes for MBR partition table. Could only read {} bytes.", n_bytes_read),
-            )),
-            Err(e) => Err(e)
+            Ok(n_bytes_read) => Err(MbrError::InputTooSmall {
+                input_size: n_bytes_read,
+                error_location: "partition table",
+            }),
+            Err(e) => Err(MbrError::IoError(e.to_string())),
         }
     }
 }
@@ -465,43 +540,29 @@ pub struct Mbr {
     pub bootsector_signature: [u8; 2],
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub enum MbrProblem {
-    NullSectorIsNotNull,
-    BootloaderSignatureNotSet,
-}
-
 impl Mbr {
-    pub fn try_from_reader<B>(mut reader: B) -> Result<Self, std::io::Error>
+    pub fn try_from_reader<B>(mut reader: B) -> Result<Self, MbrError>
     where
         B: Read,
     {
-        use std::io::{Error, ErrorKind};
-
         let mut bootloader = [0; 440];
         match reader.read(&mut bootloader) {
             Ok(440) => Ok(()),
-            Ok(n_bytes_read) => Err(Error::new(
-                ErrorKind::UnexpectedEof,
-                format!(
-                    "Could not read 440 bytes for MBR bootloader. Could only read {} bytes.",
-                    n_bytes_read
-                ),
-            )),
-            Err(e) => Err(e),
+            Ok(n_bytes_read) => Err(MbrError::InputTooSmall {
+                input_size: n_bytes_read,
+                error_location: "bootloader",
+            }),
+            Err(e) => Err(MbrError::IoError(e.to_string())),
         }?;
 
         let mut drive_signature = [0; 4];
         match reader.read(&mut drive_signature) {
             Ok(4) => Ok(()),
-            Ok(n_bytes_read) => Err(Error::new(
-                ErrorKind::UnexpectedEof,
-                format!(
-                    "Could not read 4 bytes for MBR drive signature. Could only read {} bytes.",
-                    n_bytes_read
-                ),
-            )),
-            Err(e) => Err(e),
+            Ok(n_bytes_read) => Err(MbrError::InputTooSmall {
+                input_size: n_bytes_read,
+                error_location: "drive signature",
+            }),
+            Err(e) => Err(MbrError::IoError(e.to_string())),
         }?;
 
         let mut zero_buf = [0; 2];
@@ -509,21 +570,12 @@ impl Mbr {
             Ok(2) if zero_buf == [0, 0] => Ok(()),
             // Copy protected according to spec on wikipedia - we'll just ignore it
             Ok(2) if zero_buf == [0x5A, 0x5A] => Ok(()),
-            Ok(2) => Err(Error::new(
-                ErrorKind::InvalidData,
-                format!(
-                    "MBR null sector is not null but rather {:02x} {:02x}",
-                    zero_buf[0], zero_buf[1]
-                ),
-            )),
-            Ok(n_bytes_read) => Err(Error::new(
-                ErrorKind::UnexpectedEof,
-                format!(
-                    "Could not read 2 bytes for MBR null sector. Could only read {} bytes.",
-                    n_bytes_read
-                ),
-            )),
-            Err(e) => Err(e),
+            Ok(2) => Err(MbrError::NullSectorIsNotNull { val: zero_buf }),
+            Ok(n_bytes_read) => Err(MbrError::InputTooSmall {
+                input_size: n_bytes_read,
+                error_location: "null sector",
+            }),
+            Err(e) => Err(MbrError::IoError(e.to_string())),
         }?;
 
         let partition_table = MbrPartTable::try_from_reader(&mut reader)?;
@@ -531,11 +583,11 @@ impl Mbr {
 
         match reader.read(&mut bootsector_signature) {
             Ok(2) => Ok(()),
-            Ok(n_bytes_read) => Err(Error::new(
-                ErrorKind::UnexpectedEof,
-                format!("Could not read the required 2 bytes for MBR bootsector signature. Could only read {} bytes.", n_bytes_read),
-            )),
-            Err(e) => Err(e),
+            Ok(n_bytes_read) => Err(MbrError::InputTooSmall {
+                input_size: n_bytes_read,
+                error_location: "bootsector signature",
+            }),
+            Err(e) => Err(MbrError::IoError(e.to_string())),
         }?;
         Ok(Self {
             bootloader,
@@ -593,6 +645,19 @@ mod tests {
         out_file.write_all(&buf).unwrap();
     }
 
+    /*
+    #[test]
+    fn new_image() {
+        let raspios_img = File::open("./raspios.img").unwrap();
+        let mut mbr = Mbr::try_from_reader(raspios_img).unwrap();
+        mbr.drive_signature = 0x191b3d33_u32.to_le_bytes();
+
+        let mut out_file = File::create("./out.img").unwrap();
+        let buf = <[u8; 512]>::try_from(&mbr).unwrap();
+        out_file.write_all(&buf).unwrap();
+    }
+    */
+
     #[test]
     fn chs_entry_inv() {
         let e1 = ChsEntry { raw: [6, 4, 33] };
@@ -619,9 +684,30 @@ mod tests {
             ChsEntry::try_from_lba(8192),
             Ok(ChsEntry::try_from_chs(64, 0, 1).unwrap())
         );
-        assert_eq!(ChsEntry::try_from_lba(532479), Err((4159, 3, 32)));
-        assert_eq!(ChsEntry::try_from_lba(532480), Err((4160, 0, 1)));
-        assert_eq!(ChsEntry::try_from_lba(3842047), Err((30015, 3, 32)));
+        assert_eq!(
+            ChsEntry::try_from_lba(532479),
+            Err(MbrError::InvalidAddressChs {
+                cylinder: 4159,
+                head: 3,
+                sector: 32
+            })
+        );
+        assert_eq!(
+            ChsEntry::try_from_lba(532480),
+            Err(MbrError::InvalidAddressChs {
+                cylinder: 4160,
+                head: 0,
+                sector: 1
+            })
+        );
+        assert_eq!(
+            ChsEntry::try_from_lba(3842047),
+            Err(MbrError::InvalidAddressChs {
+                cylinder: 30015,
+                head: 3,
+                sector: 32
+            })
+        );
     }
 
     #[test]
@@ -652,43 +738,27 @@ mod tests {
     }
 }
 
-/*
- mbr.partition_table = MbrPartTable {
-            entries: [
-                Some(PartInfo {
-                    bootable: true,
-                    first_sector_chs:
-                }),
-                None,
-                None,
-                None,
-            ]
-        };
-*/
-
-/*
-
-        PartInfo {
-            bootable: false,
-            first_sector_chs: ChsEntry {
-                raw: [
-                    0,
-                    1,
-                    64,
-                ],
-            },
-            part_type: Fat32 {
-                visible: true,
-                scheme: Lba,
-            },
-            last_sector_chs: ChsEntry {
-                raw: [
-                    3,
-                    224,
-                    255,
-                ],
-            },
-            start_sector_lba: 8192,
-            sector_count_lba: 524288,
-        },
-*/
+#[derive(Error, Debug, PartialEq, Eq, Hash)]
+pub enum MbrError {
+    #[error("can't create partition type from value {part_id:#X}. If you think this value should be valid please open an issue.")]
+    UnknownPartitionType { part_id: u8 },
+    #[error("an MBR is 512 bytes long, however the input size was only {input_size} bytes long. Couldn't read {error_location}")]
+    InputTooSmall {
+        input_size: usize,
+        error_location: &'static str,
+    },
+    #[error("the null sector in the provided MBR should be identically 0 or contain 0x5A 0x5A, but it contains {:#X} {:#X}", val[0], val[1])]
+    NullSectorIsNotNull { val: [u8; 2] },
+    #[error("IO error: {0}")]
+    IoError(String),
+    #[error("a valid MBR should contain a bootsector signature of 0x55, 0xAA at addresses 0x01FE, 0x01FF, but it contains {:#X} {:#X}", sig[0], sig[1])]
+    BootloaderSignatureNotSet { sig: [u8; 2] },
+    #[error("too many missing fields in input, can't deduce remaining fields")]
+    IncompleteInput,
+    #[error("a MBR-based CHS partition can't support CHS address ({cylinder}, {head}, {sector}). Consider switching to LBA or making the partition smaller.")]
+    InvalidAddressChs {
+        cylinder: u32,
+        head: u32,
+        sector: u32,
+    },
+}
