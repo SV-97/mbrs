@@ -1,3 +1,4 @@
+use arbitrary_int::{u10, u6};
 use std::io::Read;
 use thiserror::Error;
 
@@ -236,33 +237,29 @@ impl ChsEntry {
     /// Note that only the 6 bottom bits of sector and 10 bottom bits of cylinder can be used for CHS.
     /// If a value leaves this range this method returns None
     // TODO: use https://crates.io/crates/arbitrary-int to fix the input types
-    pub fn try_from_chs(cylinder: u16, head: u8, sector: u8) -> Option<Self> {
-        if cylinder > 0x3FF || sector > 0x3F {
-            None
-        } else {
-            Some(ChsEntry {
-                raw: [
-                    head,
-                    (sector & SECTOR_MASK) | (((cylinder & 0x300) >> 2) as u8),
-                    (cylinder & 0xFF) as u8,
-                ],
-            })
+    pub fn from_chs(cylinder: u10, head: u8, sector: u6) -> Self {
+        ChsEntry {
+            raw: [
+                head,
+                (u8::from(sector) & SECTOR_MASK) | (((u16::from(cylinder) & 0x300) >> 2) as u8),
+                (u16::from(cylinder) & 0xFF) as u8,
+            ],
         }
     }
 
-    pub fn cylinder(&self) -> u16 {
-        (((self.raw[1] & !SECTOR_MASK) as u16) << 2) | (self.raw[2] as u16)
+    pub fn cylinder(&self) -> u10 {
+        u10::new((((self.raw[1] & !SECTOR_MASK) as u16) << 2) | (self.raw[2] as u16))
     }
 
     pub fn head(&self) -> u8 {
         self.raw[0]
     }
 
-    pub fn sector(&self) -> u8 {
-        self.raw[1] & SECTOR_MASK
+    pub fn sector(&self) -> u6 {
+        u6::new(self.raw[1] & SECTOR_MASK)
     }
 
-    pub fn chs(&self) -> (u16, u8, u8) {
+    pub fn chs(&self) -> (u10, u8, u6) {
         (self.cylinder(), self.head(), self.sector())
     }
 
@@ -275,16 +272,20 @@ impl ChsEntry {
         let cylinder = lba / (heads_per_cylinder * sectors_per_track);
         let head = (lba / sectors_per_track) % heads_per_cylinder;
         let sector = lba % sectors_per_track + 1;
-        ChsEntry::try_from_chs(
-            u16::try_from(cylinder).unwrap(),
-            u8::try_from(head).unwrap(),
-            u8::try_from(sector).unwrap(),
-        )
-        .ok_or(MbrError::InvalidAddressChs {
-            cylinder,
-            head,
-            sector,
-        })
+        match (
+            u16::try_from(cylinder)
+                .ok()
+                .and_then(|x| u10::try_new(x).ok()),
+            u8::try_from(head),
+            u8::try_from(sector).ok().and_then(|x| u6::try_new(x).ok()),
+        ) {
+            (Some(c), Ok(h), Some(s)) => Ok(ChsEntry::from_chs(c, h, s)),
+            _ => Err(MbrError::InvalidAddressChs {
+                cylinder,
+                head,
+                sector,
+            }),
+        }
     }
 
     /// Like `try_from_lba` but silently truncates the input
@@ -298,12 +299,11 @@ impl ChsEntry {
             {
                 // If we're using LBA we don't really care about the CHS entries being correct. We simply
                 // truncate the "correct" values that CHS can't represent and use those instead.
-                ChsEntry::try_from_chs(
-                    cylinder as u16 & 0x3FF,
+                ChsEntry::from_chs(
+                    u10::new(cylinder as u16 & 0x3FF),
                     head as u8,
-                    sector as u8 & SECTOR_MASK,
+                    u6::new(sector as u8 & SECTOR_MASK),
                 )
-                .unwrap()
             } else {
                 panic!("Unexpected error: {}", e)
             }
@@ -612,6 +612,31 @@ impl TryFrom<&Mbr> for [u8; 512] {
     }
 }
 
+#[derive(Error, Debug, PartialEq, Eq, Hash)]
+pub enum MbrError {
+    #[error("can't create partition type from value {part_id:#X}. If you think this value should be valid please open an issue.")]
+    UnknownPartitionType { part_id: u8 },
+    #[error("an MBR is 512 bytes long, however the input size was only {input_size} bytes long. Couldn't read {error_location}")]
+    InputTooSmall {
+        input_size: usize,
+        error_location: &'static str,
+    },
+    #[error("the null sector in the provided MBR should be identically 0 or contain 0x5A 0x5A, but it contains {:#X} {:#X}", val[0], val[1])]
+    NullSectorIsNotNull { val: [u8; 2] },
+    #[error("IO error: {0}")]
+    IoError(String),
+    #[error("a valid MBR should contain a bootsector signature of 0x55, 0xAA at addresses 0x01FE, 0x01FF, but it contains {:#X} {:#X}", sig[0], sig[1])]
+    BootloaderSignatureNotSet { sig: [u8; 2] },
+    #[error("too many missing fields in input, can't deduce remaining fields")]
+    IncompleteInput,
+    #[error("a MBR-based CHS partition can't support CHS address ({cylinder}, {head}, {sector}). Consider switching to LBA or making the partition smaller.")]
+    InvalidAddressChs {
+        cylinder: u32,
+        head: u32,
+        sector: u32,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,27 +687,27 @@ mod tests {
     fn chs_entry_inv() {
         let e1 = ChsEntry { raw: [6, 4, 33] };
         let (c, h, s) = e1.chs();
-        let e2 = ChsEntry::try_from_chs(c, h, s);
-        assert_eq!(Some(e1), e2);
+        let e2 = ChsEntry::from_chs(c, h, s);
+        assert_eq!(e1, e2);
 
         let e1 = ChsEntry { raw: [127, 42, 33] };
         let (c, h, s) = e1.chs();
-        let e2 = ChsEntry::try_from_chs(c, h, s);
-        assert_eq!(Some(e1), e2);
+        let e2 = ChsEntry::from_chs(c, h, s);
+        assert_eq!(e1, e2);
 
         let e1 = ChsEntry {
             raw: [42, 137, 0b11001010],
         };
         let (c, h, s) = e1.chs();
-        let e2 = ChsEntry::try_from_chs(c, h, s);
-        assert_eq!(Some(e1), e2);
+        let e2 = ChsEntry::from_chs(c, h, s);
+        assert_eq!(e1, e2);
     }
 
     #[test]
     fn lba_to_chs() {
         assert_eq!(
             ChsEntry::try_from_lba(8192),
-            Ok(ChsEntry::try_from_chs(64, 0, 1).unwrap())
+            Ok(ChsEntry::from_chs(u10::new(64), 0, u6::new(1)))
         );
         assert_eq!(
             ChsEntry::try_from_lba(532479),
@@ -736,29 +761,4 @@ mod tests {
             }
         );
     }
-}
-
-#[derive(Error, Debug, PartialEq, Eq, Hash)]
-pub enum MbrError {
-    #[error("can't create partition type from value {part_id:#X}. If you think this value should be valid please open an issue.")]
-    UnknownPartitionType { part_id: u8 },
-    #[error("an MBR is 512 bytes long, however the input size was only {input_size} bytes long. Couldn't read {error_location}")]
-    InputTooSmall {
-        input_size: usize,
-        error_location: &'static str,
-    },
-    #[error("the null sector in the provided MBR should be identically 0 or contain 0x5A 0x5A, but it contains {:#X} {:#X}", val[0], val[1])]
-    NullSectorIsNotNull { val: [u8; 2] },
-    #[error("IO error: {0}")]
-    IoError(String),
-    #[error("a valid MBR should contain a bootsector signature of 0x55, 0xAA at addresses 0x01FE, 0x01FF, but it contains {:#X} {:#X}", sig[0], sig[1])]
-    BootloaderSignatureNotSet { sig: [u8; 2] },
-    #[error("too many missing fields in input, can't deduce remaining fields")]
-    IncompleteInput,
-    #[error("a MBR-based CHS partition can't support CHS address ({cylinder}, {head}, {sector}). Consider switching to LBA or making the partition smaller.")]
-    InvalidAddressChs {
-        cylinder: u32,
-        head: u32,
-        sector: u32,
-    },
 }
