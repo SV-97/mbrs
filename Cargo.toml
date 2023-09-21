@@ -1,6 +1,6 @@
 [package]
 name = "mbrs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Stefan Volz <volzstefan97+mbrs@googlemail.com>"]
 description = "Master boot record parsing, manipulation and binary export"
