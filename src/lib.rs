@@ -557,6 +557,18 @@ pub struct Mbr {
     pub bootsector_signature: [u8; 2],
 }
 
+impl Default for Mbr {
+    /// Returns an empty MBR
+    fn default() -> Self {
+        Mbr {
+            bootloader: [0; 440],
+            drive_signature: [0; 4],
+            partition_table: MbrPartTable { entries: [None; 4] },
+            bootsector_signature: [0x55, 0xAA],
+        }
+    }
+}
+
 impl Mbr {
     pub fn try_from_bytes<'a, B>(b: B) -> Result<Self, MbrError>
     where
