@@ -1,6 +1,9 @@
+#![cfg_attr(not(feature = "std"), no_std)]
 use arbitrary_int::{u10, u6};
+use arrayref::array_ref;
+#[cfg(feature = "std")]
 use std::io::Read;
-use thiserror::Error;
+use thiserror_no_std::Error;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum AddrScheme {
@@ -430,9 +433,9 @@ pub enum PartInfoErr {
     UnknownPartType,
 }
 
-impl TryFrom<[u8; 16]> for PartInfo {
+impl TryFrom<&[u8; 16]> for PartInfo {
     type Error = PartInfoErr;
-    fn try_from(buf: [u8; 16]) -> Result<Self, Self::Error> {
+    fn try_from(buf: &[u8; 16]) -> Result<Self, Self::Error> {
         let bootable = match buf[0] {
             0x80 => Ok(true),
             0x00 => Ok(false),
@@ -444,13 +447,13 @@ impl TryFrom<[u8; 16]> for PartInfo {
             bootable,
             part_type,
             first_sector_chs: ChsEntry {
-                raw: buf[1..4].try_into().unwrap(),
+                raw: *array_ref![buf, 1, 3],
             },
             last_sector_chs: ChsEntry {
-                raw: buf[5..8].try_into().unwrap(),
+                raw: *array_ref![buf, 5, 3],
             },
-            start_sector_lba: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            sector_count_lba: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            start_sector_lba: u32::from_le_bytes(*array_ref![buf, 8, 4]),
+            sector_count_lba: u32::from_le_bytes(*array_ref![buf, 12, 4]),
         })
     }
 }
@@ -474,19 +477,19 @@ pub struct MbrPartTable {
     pub entries: [Option<PartInfo>; 4],
 }
 
-impl From<[u8; 64]> for MbrPartTable {
-    fn from(buf: [u8; 64]) -> Self {
-        let from_slice = |buf| match PartInfo::try_from(<[u8; 16]>::try_from(buf).unwrap()).ok() {
+impl From<&[u8; 64]> for MbrPartTable {
+    fn from(buf: &[u8; 64]) -> Self {
+        let from_slice = |arr| match PartInfo::try_from(arr).ok() {
             // We'll convert empty partition types into Nones here
             Some(p) if p.is_zeroed() => None,
             x => x,
         };
         MbrPartTable {
             entries: [
-                from_slice(&buf[0..16]),
-                from_slice(&buf[16..32]),
-                from_slice(&buf[32..48]),
-                from_slice(&buf[48..64]),
+                from_slice(array_ref![buf, 0, 16]),
+                from_slice(array_ref![buf, 16, 16]),
+                from_slice(array_ref![buf, 32, 16]),
+                from_slice(array_ref![buf, 48, 16]),
             ],
         }
     }
@@ -516,6 +519,7 @@ impl TryFrom<MbrPartTable> for [u8; 64] {
     }
 }
 
+#[cfg(feature = "std")]
 impl MbrPartTable {
     pub fn try_from_reader<B>(mut reader: B) -> Result<Self, MbrError>
     where
@@ -523,7 +527,7 @@ impl MbrPartTable {
     {
         let mut buf = [0; 64];
         match reader.read(&mut buf) {
-            Ok(64) => Ok(Self::from(buf)),
+            Ok(64) => Ok(Self::from(&buf)),
             Ok(n_bytes_read) => Err(MbrError::InputTooSmall {
                 input_size: n_bytes_read,
                 error_location: "partition table",
@@ -532,6 +536,16 @@ impl MbrPartTable {
         }
     }
 }
+
+impl MbrPartTable {
+    pub fn from_bytes<'a, B>(b: B) -> Self
+    where
+        B: Into<&'a [u8; 64]>,
+    {
+        Self::from(b.into())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct Mbr {
     pub bootloader: [u8; 440],
@@ -540,6 +554,36 @@ pub struct Mbr {
     pub bootsector_signature: [u8; 2],
 }
 
+impl Mbr {
+    pub fn try_from_bytes<'a, B>(b: B) -> Result<Self, MbrError>
+    where
+        B: Into<&'a [u8; 512]>,
+    {
+        let buf = b.into();
+        let bootloader = *array_ref![buf, 0, 440];
+        let drive_signature = *array_ref![buf, 440, 4];
+        let zero_buf = *array_ref![buf, 444, 2];
+
+        match &zero_buf {
+            [0, 0] => Ok(()),
+            // Copy protected according to spec on wikipedia - we'll just ignore it
+            [0x5A, 0x5A] => Ok(()),
+            _ => Err(MbrError::NullSectorIsNotNull { val: zero_buf }),
+        }?;
+
+        let partition_table = MbrPartTable::from_bytes(array_ref![buf, 446, 64]);
+        let bootsector_signature = *array_ref![buf, 510, 2];
+
+        Ok(Self {
+            bootloader,
+            drive_signature,
+            partition_table,
+            bootsector_signature,
+        })
+    }
+}
+
+#[cfg(feature = "std")]
 impl Mbr {
     pub fn try_from_reader<B>(mut reader: B) -> Result<Self, MbrError>
     where
@@ -623,6 +667,7 @@ pub enum MbrError {
     },
     #[error("the null sector in the provided MBR should be identically 0 or contain 0x5A 0x5A, but it contains {:#X} {:#X}", val[0], val[1])]
     NullSectorIsNotNull { val: [u8; 2] },
+    #[cfg(feature = "std")]
     #[error("IO error: {0}")]
     IoError(String),
     #[error("a valid MBR should contain a bootsector signature of 0x55, 0xAA at addresses 0x01FE, 0x01FF, but it contains {:#X} {:#X}", sig[0], sig[1])]
@@ -637,6 +682,7 @@ pub enum MbrError {
     },
 }
 
+#[cfg(feature = "std")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,19 +715,11 @@ mod tests {
         let buf = <[u8; 512]>::try_from(&mbr).unwrap();
         out_file.write_all(&buf).unwrap();
     }
+}
 
-    /*
-    #[test]
-    fn new_image() {
-        let raspios_img = File::open("./raspios.img").unwrap();
-        let mut mbr = Mbr::try_from_reader(raspios_img).unwrap();
-        mbr.drive_signature = 0x191b3d33_u32.to_le_bytes();
-
-        let mut out_file = File::create("./out.img").unwrap();
-        let buf = <[u8; 512]>::try_from(&mbr).unwrap();
-        out_file.write_all(&buf).unwrap();
-    }
-    */
+#[cfg(test)]
+mod tests_no_std {
+    use super::*;
 
     #[test]
     fn chs_entry_inv() {
