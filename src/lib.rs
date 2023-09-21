@@ -340,13 +340,17 @@ impl TryFrom<IncompletePartInfo> for PartInfo {
     fn try_from(value: IncompletePartInfo) -> Result<Self, Self::Error> {
         // Use 0 = start + size - end - 1 in different forms to calculate missing fields
         let (start, size) = match (value.start_lba, value.end_lba, value.size_lba) {
-            (Some(start), Some(end), Some(size)) if 1 == start + size - end => Ok((start, size)),
+            (Some(start), Some(end), Some(size)) if 1 == start + size - end && start < end => {
+                Ok((start, size))
+            }
             (Some(start), Some(end), Some(size)) => {
                 Err(MbrError::InconsistentPartInfo { start, end, size })
             }
-            (Some(start), Some(end), None) => Ok((start, 1 + end - start)),
+            (Some(start), Some(end), None) if start < end => Ok((start, 1 + end - start)),
+            (Some(_start), Some(_end), None) => Err(MbrError::BrokenPartitionBounds),
             (Some(start), None, Some(size)) => Ok((start, size)),
-            (None, Some(end), Some(size)) => Ok((1 + end - size, end)),
+            (None, Some(end), Some(size)) if size <= end => Ok((1 + end - size, end)),
+            (None, Some(_end), Some(_size)) => Err(MbrError::BrokenPartitionBounds),
             _ => Err(MbrError::IncompleteInput),
         }?;
         PartInfo::try_from_lba(value.bootable, start, size, value.part_type)
@@ -721,6 +725,8 @@ pub enum MbrError {
     },
     #[error("the given partition information is inconsistent: there can be no partition of size {size}s starting at {start}s and ending at {end}s")]
     InconsistentPartInfo { start: u32, end: u32, size: u32 },
+    #[error("you attempted to create a partition with a negative size or address")]
+    BrokenPartitionBounds,
 }
 
 #[cfg(feature = "std")]
