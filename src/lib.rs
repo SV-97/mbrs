@@ -436,6 +436,22 @@ impl PartInfo {
     pub fn end_sector_lba(&self) -> u32 {
         self.start_sector_lba + self.sector_count_lba - 1
     }
+
+    pub fn part_type(&self) -> &PartType {
+        &self.part_type
+    }
+
+    pub fn bootable(&self) -> bool {
+        self.bootable
+    }
+
+    pub fn first_sector_chs(&self) -> ChsEntry {
+        self.first_sector_chs
+    }
+
+    pub fn last_sector_chs(&self) -> ChsEntry {
+        self.last_sector_chs
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
