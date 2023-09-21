@@ -60,8 +60,8 @@ impl PartType {
             PartType::Fat32 { scheme, .. }
             | PartType::Fat16 { scheme, .. }
             | PartType::Extended { scheme, .. } => *scheme,
-            PartType::LinuxNative => AddrScheme::Lba,
-            _ => unimplemented!(),
+            // PartType::LinuxNative => AddrScheme::Lba,
+            _ => AddrScheme::Lba,
         }
     }
 
