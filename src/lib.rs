@@ -425,6 +425,14 @@ impl PartInfo {
             && self.sector_count_lba == 0
     }
 
+    pub fn sector_count_lba(&self) -> u32 {
+        self.sector_count_lba
+    }
+
+    pub fn start_sector_lba(&self) -> u32 {
+        self.start_sector_lba
+    }
+
     pub fn end_sector_lba(&self) -> u32 {
         self.start_sector_lba + self.sector_count_lba - 1
     }
