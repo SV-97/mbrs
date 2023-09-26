@@ -458,10 +458,14 @@ impl PartInfo {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Error, Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum PartInfoErr {
-    UnclearBootable,
-    UnknownPartType,
+    #[error("the `bootable` value {0:#X} of the partition is invalid. Set to 0x80 for bootable and 0x00 for non-bootable.")]
+    UnclearBootable(u8),
+    #[error("the partition type is unknown.")]
+    UnknownPartType(u8),
+    #[error("the partition type is {0:?} is not valid for MBR.")]
+    NonMbrPartType(PartType),
 }
 
 impl TryFrom<&[u8; 16]> for PartInfo {
@@ -470,9 +474,10 @@ impl TryFrom<&[u8; 16]> for PartInfo {
         let bootable = match buf[0] {
             0x80 => Ok(true),
             0x00 => Ok(false),
-            _ => Err(PartInfoErr::UnclearBootable),
+            x => Err(PartInfoErr::UnclearBootable(x)),
         }?;
-        let part_type = PartType::try_from(buf[4]).map_err(|_| PartInfoErr::UnknownPartType)?;
+        let part_type =
+            PartType::try_from(buf[4]).map_err(|_| PartInfoErr::UnknownPartType(buf[4]))?;
 
         Ok(PartInfo {
             bootable,
@@ -494,7 +499,8 @@ impl TryFrom<PartInfo> for [u8; 16] {
     fn try_from(part: PartInfo) -> Result<Self, Self::Error> {
         let mut buf = [0; 16];
         buf[0] = if part.bootable { 0x80 } else { 0x00 };
-        buf[4] = u8::try_from(part.part_type).map_err(|_| PartInfoErr::UnknownPartType)?;
+        buf[4] = u8::try_from(part.part_type)
+            .map_err(|_| PartInfoErr::NonMbrPartType(part.part_type))?;
         buf[1..4].copy_from_slice(&part.first_sector_chs.raw);
         buf[5..8].copy_from_slice(&part.last_sector_chs.raw);
         buf[8..12].copy_from_slice(&part.start_sector_lba.to_le_bytes());
