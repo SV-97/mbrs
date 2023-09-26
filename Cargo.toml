@@ -1,6 +1,6 @@
 [package]
 name = "mbrs"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 authors = ["Stefan Volz <volzstefan97+mbrs@googlemail.com>"]
 description = "Master boot record parsing, manipulation and binary export"
@@ -20,8 +20,10 @@ categories = [
 [dependencies]
 arbitrary-int = "1.2.6"
 arrayref = "0.3.7"
-thiserror-no-std = "2.0.2"
+thiserror-no-std = { version = "2.0.2", optional = true }
+thiserror = { version = "1.0.48", optional = true }
 
 [features]
 default = ["std"]
-std = []
+std = ["dep:thiserror"]
+no-std = ["dep:thiserror-no-std"]

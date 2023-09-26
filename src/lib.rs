@@ -1,8 +1,15 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg(all(feature = "std", feature = "no-std"))]
+compile_error!("feature \"std\" and feature \"no-std\" cannot be enabled at the same time");
+
 use arbitrary_int::{u10, u6};
 use arrayref::array_ref;
 #[cfg(feature = "std")]
 use std::io::Read;
+#[cfg(feature = "std")]
+use thiserror::Error;
+#[cfg(feature = "no-std")]
 use thiserror_no_std::Error;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -458,7 +465,7 @@ impl PartInfo {
     }
 }
 
-#[derive(Error, Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Error)]
 pub enum PartInfoErr {
     #[error("the `bootable` value {0:#X} of the partition is invalid. Set to 0x80 for bootable and 0x00 for non-bootable.")]
     UnclearBootable(u8),
@@ -705,7 +712,7 @@ impl TryFrom<&Mbr> for [u8; 512] {
     }
 }
 
-#[derive(Error, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, Error)]
 pub enum MbrError {
     #[error("can't create partition type from value {part_id:#X}. If you think this value should be valid please open an issue.")]
     UnknownPartitionType { part_id: u8 },
